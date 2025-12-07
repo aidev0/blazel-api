@@ -1,3 +1,8 @@
-fastapi
-uvicorn
-langchain
+fastapi>=0.109.0
+uvicorn>=0.27.0
+motor>=3.3.2
+pydantic>=2.10.0
+python-dotenv>=1.0.0
+httpx>=0.26.0
+workos>=4.0.0
+python-jose[cryptography]>=3.3.0
