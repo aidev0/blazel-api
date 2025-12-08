@@ -15,7 +15,9 @@ from app.models import (
     GenerateRequest, GenerateResponse,
     FeedbackRequest, FeedbackResponse,
     TrainingDataItem, TrainRequest, TrainResponse,
-    DraftEvent
+    DraftEvent,
+    AdapterTrainRequest, AdapterTrainResponse,
+    AdapterRecordRequest, AdapterActivateRequest
 )
 from app.auth import (
     get_authorization_url,
@@ -619,3 +621,280 @@ async def stop_inference(user: User = Depends(require_auth)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== Adapter/Training Routes ==============
+
+@app.get("/adapters/training-data/{customer_id}")
+async def get_customer_training_data(
+    customer_id: str,
+    user: User = Depends(require_auth)
+):
+    """Get training data (feedback) for a specific customer. Admins only."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    db = get_db()
+
+    # Get unused feedback for this customer
+    feedback_list = await db.feedback.find({
+        "customer_id": customer_id,
+        "used_in_training": False
+    }).to_list(1000)
+
+    # Format as training examples
+    examples = []
+    for f in feedback_list:
+        examples.append({
+            "id": str(f["_id"]),
+            "input": f.get("prompt", ""),
+            "output": f.get("edited", ""),
+            "original": f.get("original", ""),
+            "rating": f.get("rating"),
+            "created_at": f.get("created_at").isoformat() if f.get("created_at") else None
+        })
+
+    return {
+        "customer_id": customer_id,
+        "count": len(examples),
+        "examples": examples
+    }
+
+
+@app.post("/adapters/train", response_model=AdapterTrainResponse)
+async def train_adapter(request: AdapterTrainRequest, user: User = Depends(require_auth)):
+    """Trigger LoRA training for a customer. Admins only."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    db = get_db()
+
+    # Get unused feedback for this customer
+    feedback_list = await db.feedback.find({
+        "customer_id": request.customer_id,
+        "used_in_training": False
+    }).to_list(1000)
+
+    if len(feedback_list) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Need at least 3 feedback samples for training. Have {len(feedback_list)}."
+        )
+
+    # Format as training examples
+    examples = []
+    for f in feedback_list:
+        examples.append({
+            "input": f.get("prompt", ""),
+            "output": f.get("edited", "")
+        })
+
+    # Send to trainer service
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{TRAINER_URL}/train",
+                json={
+                    "customer_id": request.customer_id,
+                    "examples": examples,
+                    "epochs": request.epochs,
+                    "learning_rate": request.learning_rate,
+                    "lora_r": request.lora_r,
+                    "lora_alpha": request.lora_alpha
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            # Mark feedback as used in training
+            feedback_ids = [f["_id"] for f in feedback_list]
+            await db.feedback.update_many(
+                {"_id": {"$in": feedback_ids}},
+                {"$set": {"used_in_training": True}}
+            )
+
+            return AdapterTrainResponse(
+                job_id=result.get("job_id", ""),
+                status=result.get("status", "queued"),
+                customer_id=request.customer_id,
+                feedback_count=len(examples),
+                message=f"Training started with {len(examples)} samples"
+            )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Trainer service unavailable: {str(e)}")
+
+
+@app.post("/adapters/record")
+async def record_adapter(request: AdapterRecordRequest):
+    """Record a completed adapter in the database. Called by trainer service."""
+    db = get_db()
+
+    # Get next version number for this customer
+    latest = await db.adapters.find_one(
+        {"customer_id": request.customer_id},
+        sort=[("version", -1)]
+    )
+    next_version = (latest["version"] + 1) if latest else 1
+
+    # Deactivate all existing adapters for this customer
+    await db.adapters.update_many(
+        {"customer_id": request.customer_id},
+        {"$set": {"is_active": False}}
+    )
+
+    # Create new adapter record (active by default)
+    adapter = {
+        "customer_id": request.customer_id,
+        "version": next_version,
+        "gcs_url": request.gcs_url,
+        "local_path": request.local_path,
+        "is_active": True,
+        "job_id": request.job_id,
+        "epochs": request.epochs,
+        "learning_rate": request.learning_rate,
+        "lora_r": request.lora_r,
+        "lora_alpha": request.lora_alpha,
+        "training_samples": request.training_samples,
+        "created_at": datetime.utcnow()
+    }
+    result = await db.adapters.insert_one(adapter)
+
+    return {
+        "adapter_id": str(result.inserted_id),
+        "customer_id": request.customer_id,
+        "version": next_version,
+        "gcs_url": request.gcs_url,
+        "message": f"Adapter v{next_version} recorded and activated"
+    }
+
+
+@app.get("/adapters")
+async def list_adapters(
+    customer_id: str = None,
+    user: User = Depends(require_auth)
+):
+    """List adapters. Admins can see all/filter by customer. Regular users see their own."""
+    db = get_db()
+
+    if user.is_admin and customer_id:
+        query = {"customer_id": customer_id}
+    elif user.is_admin:
+        query = {}
+    else:
+        query = {"customer_id": user.customer_id}
+
+    adapters = await db.adapters.find(query).sort("created_at", -1).to_list(100)
+
+    result = []
+    for a in adapters:
+        result.append({
+            "id": str(a["_id"]),
+            "customer_id": a.get("customer_id"),
+            "version": a.get("version"),
+            "gcs_url": a.get("gcs_url"),
+            "is_active": a.get("is_active", False),
+            "epochs": a.get("epochs"),
+            "training_samples": a.get("training_samples"),
+            "created_at": a.get("created_at").isoformat() if a.get("created_at") else None
+        })
+
+    return {"adapters": result}
+
+
+@app.get("/adapters/active/{customer_id}")
+async def get_active_adapter(customer_id: str, user: User = Depends(require_auth)):
+    """Get the active adapter for a customer."""
+    db = get_db()
+
+    # Authorization check
+    if not user.is_admin and user.customer_id != customer_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    adapter = await db.adapters.find_one({
+        "customer_id": customer_id,
+        "is_active": True
+    })
+
+    if not adapter:
+        return {"adapter": None, "message": "No active adapter for this customer"}
+
+    return {
+        "adapter": {
+            "id": str(adapter["_id"]),
+            "customer_id": adapter.get("customer_id"),
+            "version": adapter.get("version"),
+            "gcs_url": adapter.get("gcs_url"),
+            "is_active": True,
+            "epochs": adapter.get("epochs"),
+            "training_samples": adapter.get("training_samples"),
+            "created_at": adapter.get("created_at").isoformat() if adapter.get("created_at") else None
+        }
+    }
+
+
+@app.put("/adapters/{adapter_id}/activate")
+async def activate_adapter(adapter_id: str, user: User = Depends(require_auth)):
+    """Activate a specific adapter version. Deactivates others for the same customer."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    db = get_db()
+
+    # Get the adapter
+    adapter = await db.adapters.find_one({"_id": ObjectId(adapter_id)})
+    if not adapter:
+        raise HTTPException(status_code=404, detail="Adapter not found")
+
+    customer_id = adapter["customer_id"]
+
+    # Deactivate all adapters for this customer
+    await db.adapters.update_many(
+        {"customer_id": customer_id},
+        {"$set": {"is_active": False}}
+    )
+
+    # Activate the selected adapter
+    await db.adapters.update_one(
+        {"_id": ObjectId(adapter_id)},
+        {"$set": {"is_active": True}}
+    )
+
+    # Notify inference service to reload adapter
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{INFERENCE_URL}/reload-adapter",
+                json={
+                    "customer_id": customer_id,
+                    "adapter_path": adapter.get("gcs_url") or adapter.get("local_path")
+                }
+            )
+    except Exception as e:
+        print(f"[WARN] Failed to notify inference service: {e}")
+
+    return {
+        "status": "activated",
+        "adapter_id": adapter_id,
+        "customer_id": customer_id,
+        "version": adapter.get("version"),
+        "message": f"Adapter v{adapter.get('version')} is now active"
+    }
+
+
+@app.get("/training-jobs/{job_id}")
+async def get_training_job_status(job_id: str, user: User = Depends(require_auth)):
+    """Get status of a training job from the trainer service."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{TRAINER_URL}/jobs/{job_id}")
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=e.response.status_code, detail="Trainer error")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Trainer service unavailable: {str(e)}")

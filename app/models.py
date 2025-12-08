@@ -77,3 +77,57 @@ class DraftEvent(BaseModel):
     error: Optional[str] = None
     index: Optional[int] = None
     total: Optional[int] = None
+
+
+# ============== Adapter Models ==============
+
+class AdapterTrainRequest(BaseModel):
+    """Request to train a LoRA adapter for a customer"""
+    customer_id: str
+    epochs: int = 3
+    learning_rate: float = 2e-4
+    lora_r: int = 16
+    lora_alpha: int = 32
+
+
+class AdapterTrainResponse(BaseModel):
+    job_id: str
+    status: str
+    customer_id: str
+    feedback_count: int
+    message: str
+
+
+class AdapterRecordRequest(BaseModel):
+    """Request from trainer to record a completed adapter"""
+    customer_id: str
+    job_id: str
+    gcs_url: str
+    local_path: Optional[str] = None
+    epochs: int
+    learning_rate: float
+    lora_r: int
+    lora_alpha: int
+    training_samples: int
+
+
+class Adapter(BaseModel):
+    """LoRA adapter metadata"""
+    id: Optional[str] = Field(default=None, alias="_id")
+    customer_id: str
+    version: int  # Auto-incremented per customer
+    gcs_url: str  # gs://bucket/customer/adapter_v1
+    local_path: Optional[str] = None
+    is_active: bool = False  # Only one active per customer
+    job_id: str
+    epochs: int
+    learning_rate: float
+    lora_r: int
+    lora_alpha: int
+    training_samples: int
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AdapterActivateRequest(BaseModel):
+    """Request to activate a specific adapter version"""
+    adapter_id: str
