@@ -882,6 +882,35 @@ async def activate_adapter(adapter_id: str, user: User = Depends(require_auth)):
     }
 
 
+@app.put("/adapters/{adapter_id}/deactivate")
+async def deactivate_adapter(adapter_id: str, user: User = Depends(require_auth)):
+    """Deactivate an adapter. Inference will use the base model only."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    db = get_db()
+
+    # Get the adapter
+    adapter = await db.adapters.find_one({"_id": ObjectId(adapter_id)})
+    if not adapter:
+        raise HTTPException(status_code=404, detail="Adapter not found")
+
+    customer_id = adapter["customer_id"]
+
+    # Deactivate the adapter
+    await db.adapters.update_one(
+        {"_id": ObjectId(adapter_id)},
+        {"$set": {"is_active": False}}
+    )
+
+    return {
+        "status": "deactivated",
+        "adapter_id": adapter_id,
+        "customer_id": customer_id,
+        "message": "Adapter deactivated. Inference will use the base model."
+    }
+
+
 @app.get("/training-jobs/{job_id}")
 async def get_training_job_status(job_id: str, user: User = Depends(require_auth)):
     """Get status of a training job from the trainer service.
