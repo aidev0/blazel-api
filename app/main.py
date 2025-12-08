@@ -1,24 +1,28 @@
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from contextlib import asynccontextmanager
 from datetime import datetime
 from bson import ObjectId
 import httpx
 import os
+import json
+import asyncio
 
 from app.database import connect_db, close_db, get_db
-from app.config import INFERENCE_URL, TRAINER_URL
+from app.config import INFERENCE_URL, TRAINER_URL, GCP_PROJECT, GCP_ZONE, GCP_INFERENCE_INSTANCE, GCP_CREDENTIALS_JSON
 from app.models import (
     GenerateRequest, GenerateResponse,
     FeedbackRequest, FeedbackResponse,
-    TrainingDataItem, TrainRequest, TrainResponse
+    TrainingDataItem, TrainRequest, TrainResponse,
+    DraftEvent
 )
 from app.auth import (
     get_authorization_url,
     authenticate_with_code,
     get_current_user,
     require_auth,
+    require_admin,
     User,
     TokenResponse,
     FRONTEND_URL
@@ -86,18 +90,34 @@ async def health():
 
 # ============== Protected Routes ==============
 
-@app.post("/generate", response_model=GenerateResponse)
-async def generate_post(request: GenerateRequest, user: User = Depends(require_auth)):
+@app.get("/generate/stream")
+async def generate_post_stream(
+    topic: str,
+    context: str = None,
+    variations: int = 1,
+    customer_id: str = None,  # For marketing managers
+    user: User = Depends(require_auth)
+):
+    """
+    Stream draft generation using Server-Sent Events.
+    Each draft is saved to DB and streamed to client immediately after generation.
+    """
     db = get_db()
 
-    prompt = f"Write a LinkedIn post about: {request.topic}"
-    if request.context:
-        prompt += f"\nContext: {request.context}"
+    # Determine which customer to generate for
+    # Admins can generate for any customer, regular users can only generate for themselves
+    target_customer_id = customer_id if (user.is_admin and customer_id) else user.customer_id
 
-    # Get style hints from user's previous feedback
-    user_rules = await db.feedback.find(
-        {"workos_user_id": user.workos_user_id}
-    ).sort("created_at", -1).limit(5).to_list(5)
+    if not target_customer_id:
+        raise HTTPException(status_code=400, detail="No customer_id available")
+
+    prompt = f"Write a LinkedIn post about: {topic}"
+    if context:
+        prompt += f"\nContext: {context}"
+
+    # Get style hints from customer's previous feedback
+    feedback_query = {"customer_id": target_customer_id}
+    user_rules = await db.feedback.find(feedback_query).sort("created_at", -1).limit(5).to_list(5)
 
     style_hints = []
     for rule in user_rules:
@@ -108,12 +128,109 @@ async def generate_post(request: GenerateRequest, user: User = Depends(require_a
         prompt += f"\nStyle guidelines based on past feedback: {'; '.join(style_hints[:3])}"
 
     # Limit variations to 1-5
-    num_variations = max(1, min(5, request.variations))
+    num_variations = max(1, min(5, variations))
 
     # Temperature range: 0.3 (conservative) to 1.0 (creative)
     temperatures = [0.3 + (0.7 * i / max(1, num_variations - 1)) for i in range(num_variations)]
     if num_variations == 1:
-        temperatures = [0.7]  # Default temperature for single draft
+        temperatures = [0.7]
+
+    async def event_generator():
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for idx, temp in enumerate(temperatures):
+                try:
+                    response = await client.post(
+                        f"{INFERENCE_URL}/generate",
+                        json={
+                            "prompt": prompt,
+                            "customer_id": target_customer_id,
+                            "temperature": temp
+                        }
+                    )
+                    response.raise_for_status()
+                    generated_text = response.json().get("text", "")
+
+                    # Save draft to database immediately
+                    draft = {
+                        "customer_id": target_customer_id,
+                        "topic": topic,
+                        "context": context,
+                        "prompt": prompt,
+                        "text": generated_text,
+                        "temperature": temp,
+                        "created_at": datetime.utcnow()
+                    }
+                    result = await db.drafts.insert_one(draft)
+
+                    # Send SSE event with the new draft
+                    event = DraftEvent(
+                        event="draft",
+                        draft_id=str(result.inserted_id),
+                        text=generated_text,
+                        temperature=round(temp, 2),
+                        index=idx + 1,
+                        total=num_variations
+                    )
+                    yield f"data: {event.model_dump_json()}\n\n"
+
+                except httpx.RequestError as e:
+                    event = DraftEvent(event="error", error=f"Inference service unavailable: {str(e)}")
+                    yield f"data: {event.model_dump_json()}\n\n"
+                    break
+                except httpx.HTTPStatusError as e:
+                    event = DraftEvent(event="error", error=f"Inference failed: {e.response.status_code}")
+                    yield f"data: {event.model_dump_json()}\n\n"
+                    break
+
+        # Send completion event
+        event = DraftEvent(event="done", total=num_variations)
+        yield f"data: {event.model_dump_json()}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+@app.post("/generate", response_model=GenerateResponse)
+async def generate_post(request: GenerateRequest, user: User = Depends(require_auth)):
+    """
+    Non-streaming draft generation (backwards compatible).
+    For streaming, use GET /generate/stream
+    """
+    db = get_db()
+
+    # Determine which customer to generate for
+    # Admins can generate for any customer, regular users can only generate for themselves
+    target_customer_id = request.customer_id if (user.is_admin and request.customer_id) else user.customer_id
+
+    if not target_customer_id:
+        raise HTTPException(status_code=400, detail="No customer_id available")
+
+    prompt = f"Write a LinkedIn post about: {request.topic}"
+    if request.context:
+        prompt += f"\nContext: {request.context}"
+
+    # Get style hints from customer's previous feedback
+    feedback_query = {"customer_id": target_customer_id}
+    user_rules = await db.feedback.find(feedback_query).sort("created_at", -1).limit(5).to_list(5)
+
+    style_hints = []
+    for rule in user_rules:
+        if rule.get("comments"):
+            style_hints.extend(rule["comments"])
+
+    if style_hints:
+        prompt += f"\nStyle guidelines based on past feedback: {'; '.join(style_hints[:3])}"
+
+    num_variations = max(1, min(5, request.variations))
+    temperatures = [0.3 + (0.7 * i / max(1, num_variations - 1)) for i in range(num_variations)]
+    if num_variations == 1:
+        temperatures = [0.7]
 
     drafts_result = []
 
@@ -124,7 +241,7 @@ async def generate_post(request: GenerateRequest, user: User = Depends(require_a
                     f"{INFERENCE_URL}/generate",
                     json={
                         "prompt": prompt,
-                        "customer_id": user.workos_user_id,
+                        "customer_id": target_customer_id,
                         "temperature": temp
                     }
                 )
@@ -132,7 +249,7 @@ async def generate_post(request: GenerateRequest, user: User = Depends(require_a
                 generated_text = response.json().get("text", "")
 
                 draft = {
-                    "workos_user_id": user.workos_user_id,
+                    "customer_id": target_customer_id,
                     "topic": request.topic,
                     "context": request.context,
                     "prompt": prompt,
@@ -163,9 +280,13 @@ async def submit_feedback(request: FeedbackRequest, user: User = Depends(require
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
 
-    # Verify user owns this draft
-    if draft.get("workos_user_id") != user.workos_user_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    # Authorization: regular users can only access their own drafts, admins can access all
+    draft_customer_id = draft.get("customer_id")
+    user_customer_id = user.customer_id
+
+    if not user.is_admin:
+        if draft_customer_id != user_customer_id:
+            raise HTTPException(status_code=403, detail="Not authorized")
 
     # Check if feedback already exists for this draft
     existing_feedback = await db.feedback.find_one({"draft_id": request.draft_id})
@@ -192,7 +313,7 @@ async def submit_feedback(request: FeedbackRequest, user: User = Depends(require
     else:
         # Create new feedback
         feedback = {
-            "workos_user_id": user.workos_user_id,
+            "customer_id": draft_customer_id,
             "draft_id": request.draft_id,
             "prompt": draft.get("prompt", ""),
             "original": request.original,
@@ -216,7 +337,7 @@ async def get_training_data(
 ):
     db = get_db()
 
-    query = {"workos_user_id": user.workos_user_id, "used_in_training": False}
+    query = {"customer_id": user.customer_id, "used_in_training": False}
 
     samples = await db.feedback.find(query).limit(limit).to_list(limit)
 
@@ -226,7 +347,7 @@ async def get_training_data(
             prompt=sample["prompt"],
             chosen=sample["edited"],
             rejected=sample["original"],
-            workos_user_id=sample["workos_user_id"]
+            customer_id=sample["customer_id"]
         ))
 
     return {"count": len(training_data), "data": training_data}
@@ -236,7 +357,7 @@ async def trigger_training(request: TrainRequest, user: User = Depends(require_a
     db = get_db()
 
     count = await db.feedback.count_documents({
-        "workos_user_id": user.workos_user_id,
+        "customer_id": user.customer_id,
         "used_in_training": False
     })
 
@@ -251,13 +372,13 @@ async def trigger_training(request: TrainRequest, user: User = Depends(require_a
         async with httpx.AsyncClient(timeout=300.0) as client:
             response = await client.post(
                 f"{TRAINER_URL}/train",
-                json={"customer_id": user.workos_user_id}
+                json={"customer_id": user.customer_id}
             )
             response.raise_for_status()
             result = response.json()
 
             await db.feedback.update_many(
-                {"workos_user_id": user.workos_user_id, "used_in_training": False},
+                {"customer_id": user.customer_id, "used_in_training": False},
                 {"$set": {"used_in_training": True}}
             )
 
@@ -272,14 +393,26 @@ async def trigger_training(request: TrainRequest, user: User = Depends(require_a
 @app.get("/drafts")
 async def list_drafts(
     limit: int = 50,
+    customer_id: str = None,  # For marketing managers to filter by customer
     user: User = Depends(require_auth)
 ):
-    """Get all drafts for the current user"""
+    """Get drafts. Admins can view all customers, others see only their own."""
     db = get_db()
 
-    drafts = await db.drafts.find(
-        {"workos_user_id": user.workos_user_id}
-    ).sort("created_at", -1).limit(limit).to_list(limit)
+    # Build query based on admin status
+    if user.is_admin and customer_id:
+        # Admin filtering by specific customer
+        query = {"customer_id": customer_id}
+    elif user.is_admin:
+        # Admin sees all drafts
+        query = {}
+    else:
+        # Regular user sees only their drafts
+        # Use customer_id if available, otherwise fall back to workos_user_id
+        user_customer_id = user.customer_id or user.workos_user_id
+        query = {"customer_id": user_customer_id}
+
+    drafts = await db.drafts.find(query).sort("created_at", -1).limit(limit).to_list(limit)
 
     result = []
     for d in drafts:
@@ -287,6 +420,7 @@ async def list_drafts(
         feedback = await db.feedback.find_one({"draft_id": str(d["_id"])})
         result.append({
             "id": str(d["_id"]),
+            "customer_id": d.get("customer_id"),
             "topic": d.get("topic", ""),
             "text": d.get("text", ""),
             "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
@@ -304,15 +438,23 @@ async def get_draft(
     """Get a single draft by ID"""
     db = get_db()
 
-    draft = await db.drafts.find_one({"_id": ObjectId(draft_id), "workos_user_id": user.workos_user_id})
+    draft = await db.drafts.find_one({"_id": ObjectId(draft_id)})
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Authorization check: admins can view all, regular users only their own
+    draft_customer_id = draft.get("customer_id")
+
+    if not user.is_admin:
+        if draft_customer_id != user.customer_id:
+            raise HTTPException(status_code=403, detail="Not authorized")
 
     # Get feedback if exists
     feedback = await db.feedback.find_one({"draft_id": draft_id})
 
     return {
         "id": str(draft["_id"]),
+        "customer_id": draft.get("customer_id"),
         "topic": draft.get("topic", ""),
         "context": draft.get("context", ""),
         "text": draft.get("text", ""),
@@ -329,14 +471,151 @@ async def get_feedback_history(
     limit: int = 20,
     user: User = Depends(require_auth)
 ):
-    """Get feedback history for the current user"""
+    """Get feedback history for the current user/customer"""
     db = get_db()
 
     samples = await db.feedback.find(
-        {"workos_user_id": user.workos_user_id}
+        {"customer_id": user.customer_id}
     ).sort("created_at", -1).limit(limit).to_list(limit)
 
     for s in samples:
         s["_id"] = str(s["_id"])
 
     return {"feedback": samples}
+
+@app.get("/customers")
+async def list_customers(user: User = Depends(require_auth)):
+    """List all customers. Admins see all, regular users see only themselves."""
+    db = get_db()
+
+    if user.is_admin:
+        # Get all users as potential customers
+        all_users = await db.users.find({"workos_user_id": {"$exists": True}}).to_list(100)
+
+        # Also get customer_ids from drafts (in case there are orphaned drafts)
+        draft_customer_ids = set(await db.drafts.distinct("customer_id"))
+
+        customers = []
+        seen_ids = set()
+
+        # Add all users (using workos_user_id as customer_id)
+        for u in all_users:
+            cid = u.get("workos_user_id")
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+
+            draft_count = await db.drafts.count_documents({"customer_id": cid})
+            customers.append({
+                "customer_id": cid,
+                "email": u.get("email"),
+                "first_name": u.get("first_name"),
+                "last_name": u.get("last_name"),
+                "draft_count": draft_count
+            })
+
+        # Add any orphaned customer_ids from drafts not in users
+        for cid in draft_customer_ids:
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            draft_count = await db.drafts.count_documents({"customer_id": cid})
+            customers.append({
+                "customer_id": cid,
+                "email": None,
+                "first_name": None,
+                "last_name": None,
+                "draft_count": draft_count
+            })
+
+        # Sort by email or customer_id
+        customers.sort(key=lambda c: c.get("email") or c.get("customer_id") or "")
+
+        return {"customers": customers}
+    else:
+        # Regular user sees only themselves
+        # Use workos_user_id as customer_id (consistent with how drafts are created)
+        customer_id = user.customer_id or user.workos_user_id
+        if not customer_id:
+            return {"customers": []}
+        draft_count = await db.drafts.count_documents({"customer_id": customer_id})
+        return {
+            "customers": [{
+                "customer_id": customer_id,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "draft_count": draft_count
+            }]
+        }
+
+# ============== Infrastructure Routes ==============
+
+def get_compute_client():
+    """Get GCP Compute client
+    - Heroku: uses GCP_CREDENTIALS_JSON env var (JSON content)
+    - Local: uses GOOGLE_APPLICATION_CREDENTIALS env var (file path)
+    - GCP: uses Workload Identity (automatic)
+    """
+    from google.cloud import compute_v1
+
+    if GCP_CREDENTIALS_JSON:
+        import json
+        from google.oauth2 import service_account
+        credentials_info = json.loads(GCP_CREDENTIALS_JSON)
+        credentials = service_account.Credentials.from_service_account_info(credentials_info)
+        return compute_v1.InstancesClient(credentials=credentials)
+
+    # Falls back to GOOGLE_APPLICATION_CREDENTIALS or Workload Identity
+    return compute_v1.InstancesClient()
+
+@app.get("/infra/status")
+async def get_inference_status(user: User = Depends(require_auth)):
+    """Get the status of the inference VM"""
+    if not GCP_PROJECT:
+        return {"status": "disabled", "message": "GCP not configured"}
+
+    try:
+        client = get_compute_client()
+        instance = client.get(project=GCP_PROJECT, zone=GCP_ZONE, instance=GCP_INFERENCE_INSTANCE)
+        return {
+            "status": instance.status,
+            "instance": GCP_INFERENCE_INSTANCE,
+            "zone": GCP_ZONE
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/infra/start")
+async def start_inference(user: User = Depends(require_auth)):
+    """Start the inference VM"""
+    if not GCP_PROJECT:
+        raise HTTPException(status_code=400, detail="GCP not configured")
+
+    try:
+        client = get_compute_client()
+        operation = client.start(project=GCP_PROJECT, zone=GCP_ZONE, instance=GCP_INFERENCE_INSTANCE)
+        return {
+            "status": "starting",
+            "instance": GCP_INFERENCE_INSTANCE,
+            "operation": operation.name
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/infra/stop")
+async def stop_inference(user: User = Depends(require_auth)):
+    """Stop the inference VM"""
+    if not GCP_PROJECT:
+        raise HTTPException(status_code=400, detail="GCP not configured")
+
+    try:
+        client = get_compute_client()
+        operation = client.stop(project=GCP_PROJECT, zone=GCP_ZONE, instance=GCP_INFERENCE_INSTANCE)
+        return {
+            "status": "stopping",
+            "instance": GCP_INFERENCE_INSTANCE,
+            "operation": operation.name
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
