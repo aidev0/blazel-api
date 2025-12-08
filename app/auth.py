@@ -159,24 +159,26 @@ async def authenticate_with_code(code: str) -> TokenResponse:
 
     now = datetime.utcnow()
 
+    # IMPORTANT: Always use workos_user_id as customer_id for consistency
+    # Organization membership is only used for determining admin status
+    customer_id = workos_user.id
+
     if existing_user:
         # Update existing user
         update_fields = {
             "email": workos_user.email,
             "first_name": workos_user.first_name,
             "last_name": workos_user.last_name,
+            "customer_id": customer_id,  # Always set to workos_user_id
             "last_login": now,
             "updated_at": now
         }
-        if organization_id:
-            update_fields["customer_id"] = organization_id
 
         await db.users.update_one(
             {"_id": existing_user["_id"]},
             {"$set": update_fields}
         )
         user_id = str(existing_user["_id"])
-        customer_id = organization_id or existing_user.get("customer_id")
     else:
         # Create new user
         new_user = {
@@ -184,14 +186,13 @@ async def authenticate_with_code(code: str) -> TokenResponse:
             "email": workos_user.email,
             "first_name": workos_user.first_name,
             "last_name": workos_user.last_name,
-            "customer_id": organization_id,
+            "customer_id": customer_id,  # Always set to workos_user_id
             "created_at": now,
             "updated_at": now,
             "last_login": now
         }
         result = await db.users.insert_one(new_user)
         user_id = str(result.inserted_id)
-        customer_id = organization_id
 
     user_data = {
         "id": user_id,

@@ -4,15 +4,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ENV = os.getenv("ENV", "local")
+INFERENCE_ENV = os.getenv("INFERENCE_ENV", ENV)  # Defaults to ENV if not set
+TRAINER_ENV = os.getenv("TRAINER_ENV", ENV)  # Defaults to ENV if not set
+
 MONGODB_URI = os.getenv("MONGODB_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "blazel")
 
-# Inference URL based on environment
+# Inference URL based on INFERENCE_ENV
 LOCAL_INFERENCE_URL = os.getenv("LOCAL_INFERENCE_URL", "http://localhost:8001")
 PRODUCTION_INFERENCE_URL = os.getenv("PRODUCTION_INFERENCE_URL", "http://localhost:8001")
-INFERENCE_URL = PRODUCTION_INFERENCE_URL if ENV == "production" else LOCAL_INFERENCE_URL
+INFERENCE_URL = PRODUCTION_INFERENCE_URL if INFERENCE_ENV == "production" else LOCAL_INFERENCE_URL
 
-TRAINER_URL = os.getenv("TRAINER_URL", "http://localhost:8002")
+# Trainer URL based on TRAINER_ENV
+LOCAL_TRAINER_URL = os.getenv("LOCAL_TRAINER_URL", "http://localhost:8002")
+PRODUCTION_TRAINER_URL = os.getenv("PRODUCTION_TRAINER_URL", "http://localhost:8002")
+TRAINER_URL = PRODUCTION_TRAINER_URL if TRAINER_ENV == "production" else LOCAL_TRAINER_URL
 
 # GCP Infrastructure
 GCP_PROJECT = os.getenv("GCP_PROJECT")

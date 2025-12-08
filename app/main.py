@@ -379,10 +379,8 @@ async def trigger_training(request: TrainRequest, user: User = Depends(require_a
             response.raise_for_status()
             result = response.json()
 
-            await db.feedback.update_many(
-                {"customer_id": user.customer_id, "used_in_training": False},
-                {"$set": {"used_in_training": True}}
-            )
+            # NOTE: Don't mark feedback as used here - it will be marked in /adapters/record
+            # only after training completes successfully
 
             return TrainResponse(
                 job_id=result.get("job_id", "unknown"),
@@ -706,12 +704,8 @@ async def train_adapter(request: AdapterTrainRequest, user: User = Depends(requi
             response.raise_for_status()
             result = response.json()
 
-            # Mark feedback as used in training
-            feedback_ids = [f["_id"] for f in feedback_list]
-            await db.feedback.update_many(
-                {"_id": {"$in": feedback_ids}},
-                {"$set": {"used_in_training": True}}
-            )
+            # NOTE: Don't mark feedback as used here - it will be marked in /adapters/record
+            # only after training completes successfully
 
             return AdapterTrainResponse(
                 job_id=result.get("job_id", ""),
@@ -758,6 +752,13 @@ async def record_adapter(request: AdapterRecordRequest):
         "created_at": datetime.utcnow()
     }
     result = await db.adapters.insert_one(adapter)
+
+    # Mark feedback as used in training NOW (after successful completion)
+    # We mark all unused feedback for this customer since that's what was sent
+    await db.feedback.update_many(
+        {"customer_id": request.customer_id, "used_in_training": False},
+        {"$set": {"used_in_training": True}}
+    )
 
     return {
         "adapter_id": str(result.inserted_id),
@@ -883,15 +884,66 @@ async def activate_adapter(adapter_id: str, user: User = Depends(require_auth)):
 
 @app.get("/training-jobs/{job_id}")
 async def get_training_job_status(job_id: str, user: User = Depends(require_auth)):
-    """Get status of a training job from the trainer service."""
+    """Get status of a training job from the trainer service.
+    When training completes, automatically record the adapter in MongoDB.
+    """
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
+
+    db = get_db()
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(f"{TRAINER_URL}/jobs/{job_id}")
             response.raise_for_status()
-            return response.json()
+            job_data = response.json()
+
+            # If training completed, record the adapter in MongoDB
+            if job_data.get("status") == "completed" and job_data.get("adapter_path"):
+                # Check if we already recorded this adapter
+                existing = await db.adapters.find_one({"job_id": job_id})
+                if not existing:
+                    customer_id = job_data.get("customer_id")
+
+                    # Get next version number
+                    latest = await db.adapters.find_one(
+                        {"customer_id": customer_id},
+                        sort=[("version", -1)]
+                    )
+                    next_version = (latest["version"] + 1) if latest else 1
+
+                    # Deactivate existing adapters
+                    await db.adapters.update_many(
+                        {"customer_id": customer_id},
+                        {"$set": {"is_active": False}}
+                    )
+
+                    # Create new adapter record
+                    adapter = {
+                        "customer_id": customer_id,
+                        "version": next_version,
+                        "gcs_url": job_data.get("gcs_path") or f"local://{job_data.get('adapter_path')}",
+                        "local_path": job_data.get("adapter_path"),
+                        "is_active": True,
+                        "job_id": job_id,
+                        "epochs": job_data.get("config", {}).get("epochs", 3),
+                        "learning_rate": job_data.get("config", {}).get("learning_rate", 2e-4),
+                        "lora_r": job_data.get("config", {}).get("lora_r", 8),
+                        "lora_alpha": job_data.get("config", {}).get("lora_alpha", 16),
+                        "training_samples": job_data.get("training_samples", 0),
+                        "created_at": datetime.utcnow()
+                    }
+                    await db.adapters.insert_one(adapter)
+
+                    # Mark feedback as used
+                    await db.feedback.update_many(
+                        {"customer_id": customer_id, "used_in_training": False},
+                        {"$set": {"used_in_training": True}}
+                    )
+
+                    print(f"[API] Recorded adapter v{next_version} for {customer_id}")
+
+            return job_data
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Job not found")
