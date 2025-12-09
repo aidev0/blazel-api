@@ -665,9 +665,9 @@ async def get_customer_training_data(
     customer_id: str,
     user: User = Depends(require_auth)
 ):
-    """Get training data (feedback) for a specific customer. Admins only."""
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
+    """Get training data (feedback) for a specific customer. Users can view their own, admins can view any."""
+    if not user.is_admin and customer_id != user.customer_id:
+        raise HTTPException(status_code=403, detail="You can only view training data for your own account")
 
     db = get_db()
 
@@ -698,9 +698,10 @@ async def get_customer_training_data(
 
 @app.post("/adapters/train", response_model=AdapterTrainResponse)
 async def train_adapter(request: AdapterTrainRequest, user: User = Depends(require_auth)):
-    """Trigger LoRA training for a customer. Admins only."""
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
+    """Trigger LoRA training for a customer. Users can train their own, admins can train any."""
+    # Non-admin users can only train for their own customer_id
+    if not user.is_admin and request.customer_id != user.customer_id:
+        raise HTTPException(status_code=403, detail="You can only train adapters for your own account")
 
     db = get_db()
 
@@ -873,9 +874,6 @@ async def get_active_adapter(customer_id: str, user: User = Depends(require_auth
 @app.put("/adapters/{adapter_id}/activate")
 async def activate_adapter(adapter_id: str, user: User = Depends(require_auth)):
     """Activate a specific adapter version. Deactivates others for the same customer."""
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
-
     db = get_db()
 
     # Get the adapter
@@ -884,6 +882,10 @@ async def activate_adapter(adapter_id: str, user: User = Depends(require_auth)):
         raise HTTPException(status_code=404, detail="Adapter not found")
 
     customer_id = adapter["customer_id"]
+
+    # Non-admin users can only activate their own adapters
+    if not user.is_admin and customer_id != user.customer_id:
+        raise HTTPException(status_code=403, detail="You can only activate your own adapters")
 
     # Deactivate all adapters for this customer
     await db.adapters.update_many(
@@ -922,9 +924,6 @@ async def activate_adapter(adapter_id: str, user: User = Depends(require_auth)):
 @app.put("/adapters/{adapter_id}/deactivate")
 async def deactivate_adapter(adapter_id: str, user: User = Depends(require_auth)):
     """Deactivate an adapter. Inference will use the base model only."""
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
-
     db = get_db()
 
     # Get the adapter
@@ -933,6 +932,10 @@ async def deactivate_adapter(adapter_id: str, user: User = Depends(require_auth)
         raise HTTPException(status_code=404, detail="Adapter not found")
 
     customer_id = adapter["customer_id"]
+
+    # Non-admin users can only deactivate their own adapters
+    if not user.is_admin and customer_id != user.customer_id:
+        raise HTTPException(status_code=403, detail="You can only deactivate your own adapters")
 
     # Deactivate the adapter
     await db.adapters.update_one(
@@ -953,14 +956,17 @@ async def get_training_job_status(job_id: str, user: User = Depends(require_auth
     """Get status of a training job from the trainer service.
     Note: Trainer writes adapter to MongoDB directly after GCS upload.
     """
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
-
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(f"{TRAINER_URL}/jobs/{job_id}")
             response.raise_for_status()
-            return response.json()
+            job_data = response.json()
+
+            # Non-admin users can only view their own training jobs
+            if not user.is_admin and job_data.get("customer_id") != user.customer_id:
+                raise HTTPException(status_code=403, detail="You can only view your own training jobs")
+
+            return job_data
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Job not found")
